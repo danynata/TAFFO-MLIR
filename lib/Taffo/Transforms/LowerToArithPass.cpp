@@ -36,8 +36,8 @@ public:
 
       addTargetMaterialization(
           [&](mlir::OpBuilder &builder, mlir::TypeRange resultType,
-              mlir::ValueRange inputs,
-              mlir::Location loc, mlir::Type) -> llvm::SmallVector<mlir::Value> {
+              mlir::ValueRange inputs, mlir::Location loc,
+              mlir::Type) -> llvm::SmallVector<mlir::Value> {
             if (inputs.size() != 1) {
               return {};
             }
@@ -53,8 +53,7 @@ public:
 
       addSourceMaterialization(
           [&](mlir::OpBuilder &builder, mlir::Type resultType,
-              mlir::ValueRange inputs,
-              mlir::Location loc) -> mlir::Value {
+              mlir::ValueRange inputs, mlir::Location loc) -> mlir::Value {
             if (inputs.size() != 1) {
               return {};
             }
@@ -170,6 +169,120 @@ public:
     matchAndRewrite(AddOp op, OpAdaptor adaptor,
                     ConversionPatternRewriter &rewriter) const override {
       return ConvertAddCommon<AddOp, OpAdaptor>(op, adaptor, rewriter);
+    }
+  };
+
+  template <typename T1, typename T2>
+  static LogicalResult ConvertSubCommon(T1 op, T2 adaptor,
+                                        ConversionPatternRewriter &rewriter) {
+
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+
+    RealType resType = ::llvm::dyn_cast<RealType>(op->getResult(0).getType());
+
+    const int targetWidth = resType.getBitwidth();
+
+    auto buildIntAttr = [targetWidth](Builder b, int64_t value) -> IntegerAttr {
+      return b.getIntegerAttr(b.getIntegerType(targetWidth), value);
+    };
+
+    Value ogLhs = op.getLhs();
+    Value ogRhs = op.getRhs();
+    int lhsExp = getExp(ogLhs);
+    int rhsExp = getExp(ogRhs);
+    Value lhs = adaptor.getLhs();
+    Value rhs = adaptor.getRhs();
+
+    // reconcile arguments of different signedness (identical to ConvertAdd)
+    if (resType.getSignd() && (getSignd(ogRhs) != getSignd(ogLhs))) {
+
+      if (!getSignd(ogLhs)) {
+        lhsExp += 1;
+        lhs = b.create<arith::ShRUIOp>(
+                   lhs, b.create<arith::ConstantOp>(buildIntAttr(b, 1)))
+                  .getResult();
+      }
+
+      if (!getSignd(ogRhs)) {
+        rhsExp += 1;
+        rhs = b.create<arith::ShRUIOp>(
+                   rhs, b.create<arith::ConstantOp>(buildIntAttr(b, 1)))
+                  .getResult();
+      }
+    }
+
+    int expDiff = std::abs(rhsExp - lhsExp);
+
+    // If one operand's exponent dwarfs the other's, the smaller-magnitude
+    // operand is negligible at this bitwidth. Unlike addition, subtraction
+    // is NOT symmetric here: if rhs dominates, the result is approximately
+    // -rhs (not +rhs), since lhs contributes ~0.
+    if (expDiff > targetWidth) {
+      if (rhsExp > lhsExp) {
+        Value zero = b.create<arith::ConstantOp>(buildIntAttr(b, 0));
+        Value negRhs = b.create<arith::SubIOp>(zero, rhs).getResult();
+        rewriter.replaceOp(op, negRhs);
+      } else {
+        rewriter.replaceOp(op, lhs);
+      }
+      return success();
+    }
+
+    // Align both operands to the same (coarser/larger) exponent by shifting
+    // whichever has the SMALLER exponent right by expDiff. Unlike
+    // ConvertAdd's "no_shift"/"to_shift" naming (safe there only because
+    // addition is commutative), we track alignedLhs/alignedRhs explicitly
+    // so the final SubIOp's operand order always matches the original
+    // lhs - rhs, regardless of which one needed shifting.
+    Value alignedLhs = lhs;
+    Value alignedRhs = rhs;
+
+    if (expDiff != 0) {
+      arith::ConstantOp shift_amount =
+          b.create<arith::ConstantOp>(buildIntAttr(b, expDiff));
+      if (lhsExp < rhsExp) {
+        alignedLhs =
+            resType.getSignd()
+                ? b.create<arith::ShRSIOp>(lhs, shift_amount).getResult()
+                : b.create<arith::ShRUIOp>(lhs, shift_amount).getResult();
+      } else {
+        alignedRhs =
+            resType.getSignd()
+                ? b.create<arith::ShRSIOp>(rhs, shift_amount).getResult()
+                : b.create<arith::ShRUIOp>(rhs, shift_amount).getResult();
+      }
+    }
+
+    Value res = b.create<arith::SubIOp>(alignedLhs, alignedRhs);
+
+    int resExpDiff = resType.getExponent() - std::max(rhsExp, lhsExp);
+
+    if (resExpDiff == 0) {
+      rewriter.replaceOp(op, res);
+      return success();
+    }
+
+    arith::ConstantOp align_res =
+        b.create<arith::ConstantOp>(buildIntAttr(b, std::abs(resExpDiff)));
+    res = resExpDiff > 0
+              ? resType.getSignd()
+                    ? b.create<arith::ShRSIOp>(res, align_res).getResult()
+                    : b.create<arith::ShRUIOp>(res, align_res).getResult()
+              : b.create<arith::ShLIOp>(res, align_res).getResult();
+    rewriter.replaceOp(op, res);
+    return success();
+  }
+
+  struct ConvertSub : public OpConversionPattern<SubOp> {
+    ConvertSub(mlir::MLIRContext *context)
+        : OpConversionPattern<SubOp>(context) {}
+
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult
+    matchAndRewrite(SubOp op, OpAdaptor adaptor,
+                    ConversionPatternRewriter &rewriter) const override {
+      return ConvertSubCommon<SubOp, OpAdaptor>(op, adaptor, rewriter);
     }
   };
 
@@ -519,7 +632,133 @@ public:
       arith::BitcastOp bitcast_back =
           b.create<arith::BitcastOp>(fType, actual_exp);
 
-      rewriter.replaceOp(op, bitcast_back);
+      // FIX: the "add to the exponent bits directly" trick above only
+      // correctly scales NON-ZERO values. If the fixed-point integer is
+      // exactly 0, its float bit pattern (from SIToFP/UIToFP) is all
+      // zeros; adding a non-zero constant to THAT doesn't produce 0.0
+      // scaled by 2^exponent -- it corrupts an all-zero pattern into a
+      // spurious non-zero float with a real, garbage exponent field.
+      // Special-case it: if the source integer is zero, produce a real
+      // 0.0 directly instead of going through the bit-trick.
+      Value zeroInt = b.create<arith::ConstantOp>(
+          b.getIntegerAttr(b.getIntegerType(fromType.getBitwidth()), 0));
+      Value isZero = b.create<arith::CmpIOp>(arith::CmpIPredicate::eq,
+                                             adaptor.getFrom(), zeroInt);
+      Value zeroFloat = b.create<arith::ConstantOp>(b.getFloatAttr(fType, 0.0));
+      Value res = b.create<arith::SelectOp>(isZero, zeroFloat,
+                                            bitcast_back.getResult());
+
+      rewriter.replaceOp(op, res);
+      return success();
+    }
+  };
+
+  // Handles the case where raise-to-taffo inserts a GENERIC
+  // builtin.unrealized_conversion_cast (not a real taffo.cast2float op)
+  // to bridge an already-annotated !taffo.real value into an unraised
+  // consumer that still expects plain float (e.g. arith.maxnumf, which has
+  // no raising rule at all). ConvertCastToFloat only matches real
+  // CastToFloatOp ops, so it can never fire on these -- this pattern
+  // reuses its exact numeric logic, applied to the generic op instead.
+  //
+  // Deliberately ONE-DIRECTIONAL (RealType -> FloatType only): the reverse
+  // direction (float -> real) genuinely needs external range/precision
+  // information that can't be synthesized generically, which is why those
+  // cases are handled via explicit taffo.cast2real annotations elsewhere
+  // in the pipeline, not by a pattern like this one.
+  struct ConvertGenericCastToFloat
+      : public OpConversionPattern<UnrealizedConversionCastOp> {
+    ConvertGenericCastToFloat(mlir::MLIRContext *context)
+        : OpConversionPattern<UnrealizedConversionCastOp>(context) {}
+
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult
+    matchAndRewrite(UnrealizedConversionCastOp op, OpAdaptor adaptor,
+                    ConversionPatternRewriter &rewriter) const override {
+
+      if (op->getNumOperands() != 1 || op->getNumResults() != 1)
+        return failure();
+
+      RealType fromType =
+          ::llvm::dyn_cast<RealType>(op->getOperand(0).getType());
+      FloatType fType = ::llvm::dyn_cast<FloatType>(op->getResult(0).getType());
+
+      // Only claim the specific real->float bridging case; let every other
+      // unrealized_conversion_cast (including the reverse direction, and
+      // any unrelated type pairs) pass through untouched for other
+      // patterns / reconcile-unrealized-casts to handle.
+      if (!fromType || !fType)
+        return failure();
+
+      ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+
+      int targetWidth = fType.getWidth();
+
+      if (fromType.getBitwidth() > 64) {
+        op->emitOpError()
+            << "Conversion from fixpoints bigger than 64 is not yet supported";
+        return failure();
+      }
+
+      if (targetWidth > 64) {
+        op->emitOpError()
+            << "Conversion to floats bigger than f64 is not yet supported";
+        return failure();
+      }
+
+      if (fromType.getExponent() >
+          llvm::APFloat::semanticsMaxExponent(fType.getFloatSemantics())) {
+        op->emitOpError()
+            << "Target float type too small to represent real value";
+        return failure();
+      }
+
+      auto buildIntAttr = [targetWidth](Builder b,
+                                        int64_t value) -> IntegerAttr {
+        return b.getIntegerAttr(b.getIntegerType(targetWidth), value);
+      };
+
+      int mantissaBitwidth = fType.getFPMantissaWidth() - 1;
+
+      Value conv =
+          (fromType.getSignd())
+              ? b.create<arith::SIToFPOp>(fType, adaptor.getOperands()[0])
+                    .getResult()
+              : b.create<arith::UIToFPOp>(fType, adaptor.getOperands()[0])
+                    .getResult();
+
+      arith::BitcastOp bitcast =
+          b.create<arith::BitcastOp>(b.getIntegerType(targetWidth), conv);
+
+      IntegerAttr dtExp = buildIntAttr(
+          b, (uint64_t)(std::abs(fromType.getExponent()) << mantissaBitwidth));
+      arith::ConstantOp dtExp_const = b.create<arith::ConstantOp>(dtExp);
+      Value actual_exp =
+          fromType.getExponent() > 0
+              ? b.create<arith::AddIOp>(bitcast, dtExp_const).getResult()
+              : b.create<arith::SubIOp>(bitcast, dtExp_const).getResult();
+
+      arith::BitcastOp bitcast_back =
+          b.create<arith::BitcastOp>(fType, actual_exp);
+
+      // FIX: the "add to the exponent bits directly" trick above only
+      // correctly scales NON-ZERO values. If the fixed-point integer is
+      // exactly 0, its float bit pattern (from SIToFP/UIToFP) is all
+      // zeros; adding a non-zero constant to THAT doesn't produce 0.0
+      // scaled by 2^exponent -- it corrupts an all-zero pattern into a
+      // spurious non-zero float with a real, garbage exponent field.
+      // Special-case it: if the source integer is zero, produce a real
+      // 0.0 directly instead of going through the bit-trick.
+      Value zeroInt = b.create<arith::ConstantOp>(
+          b.getIntegerAttr(b.getIntegerType(fromType.getBitwidth()), 0));
+      Value isZero = b.create<arith::CmpIOp>(arith::CmpIPredicate::eq,
+                                             adaptor.getOperands()[0], zeroInt);
+      Value zeroFloat = b.create<arith::ConstantOp>(b.getFloatAttr(fType, 0.0));
+      Value res = b.create<arith::SelectOp>(isZero, zeroFloat,
+                                            bitcast_back.getResult());
+
+      rewriter.replaceOp(op, res);
       return success();
     }
   };
@@ -673,12 +912,31 @@ public:
     target.markUnknownOpDynamicallyLegal([](Operation *op) { return true; });
     target.addIllegalDialect<TaffoDialect>();
 
+    // builtin.unrealized_conversion_cast isn't part of TaffoDialect, so it
+    // falls under markUnknownOpDynamicallyLegal's catch-all (legal by
+    // default) -- meaning ConvertGenericCastToFloat would otherwise never
+    // even be attempted by the framework, regardless of whether it's
+    // correctly written. Explicitly mark it illegal ONLY for the specific
+    // !taffo.real -> float pattern we want converted; every other use of
+    // this op (including the type converter's own legitimate materialization
+    // bridges elsewhere) remains legal and untouched.
+    target.addDynamicallyLegalOp<UnrealizedConversionCastOp>(
+        [](UnrealizedConversionCastOp op) {
+          if (op->getNumOperands() != 1 || op->getNumResults() != 1)
+            return true; // legal: not the pattern we care about
+          bool isRealToFloat =
+              ::llvm::isa<RealType>(op->getOperand(0).getType()) &&
+              ::llvm::isa<FloatType>(op->getResult(0).getType());
+          return !isRealToFloat; // illegal (needs conversion) only when true
+        });
+
     RewritePatternSet patterns(context);
     TaffoToArithTypeConverter typeConverter(context);
 
-    patterns.add<ConvertAdd, ConvertMult, ConvertDiv, ConvertCastToReal,
-                 ConvertCastToFloat, ConvertBitcastToInt, ConvertBitcastToReal,
-                 ConvertAlign>(typeConverter, context);
+    patterns
+        .add<ConvertAdd, ConvertSub, ConvertMult, ConvertDiv, ConvertCastToReal,
+             ConvertCastToFloat, ConvertGenericCastToFloat, ConvertBitcastToInt,
+             ConvertBitcastToReal, ConvertAlign>(typeConverter, context);
 
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
       signalPassFailure();

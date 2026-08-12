@@ -3,10 +3,10 @@
 
 #include <stdint.h>
 
-#include "llvm/ADT/APFloat.h"
 #include <algorithm>
 #include <atomic>
 #include <iostream>
+#include <llvm/ADT/APFloat.h>
 #include <sstream>
 #include <vector>
 
@@ -307,42 +307,26 @@ public:
   }
 
   Var operator/(const Var &b) const {
-    Var result;
-    result.c_value = c_value / b.c_value;
-    std::set_union(noise_symbol_index.begin(), noise_symbol_index.end(),
-                   b.noise_symbol_index.begin(), b.noise_symbol_index.end(),
-                   std::back_inserter(result.noise_symbol_index));
+    auto a_range = this->get_range();
+    auto b_range = b.get_range();
 
-    unsigned int index_ida = 0;
-    unsigned int index_idb = 0;
-    for (auto i : result.noise_symbol_index) {
-      if (index_ida >= noise_symbol_index.size() ||
-          noise_symbol_index[index_ida] != i) {
-        result.noise_symbol_coeffs.push_back(-c_value /
-                                             (b.c_value * b.c_value) *
-                                             b.noise_symbol_coeffs[index_idb]);
-        index_idb++;
-        continue;
-      }
-      if (index_idb >= b.noise_symbol_index.size() ||
-          b.noise_symbol_index[index_idb] != i) {
-        result.noise_symbol_coeffs.push_back(noise_symbol_coeffs[index_ida] /
-                                             b.c_value);
-        index_ida++;
-        continue;
-      }
-      result.noise_symbol_coeffs.push_back(
-          (noise_symbol_coeffs[index_ida] * b.c_value -
-           c_value * b.noise_symbol_coeffs[index_idb]) /
-          (b.c_value * b.c_value));
-      index_ida++;
-      index_idb++;
+    llvm::APFloat corners[4] = {
+        a_range.start / b_range.start,
+        a_range.start / b_range.end,
+        a_range.end / b_range.start,
+        a_range.end / b_range.end,
+    };
+
+    llvm::APFloat lo = corners[0];
+    llvm::APFloat hi = corners[0];
+    for (int i = 1; i < 4; i++) {
+      if (corners[i].compare(lo) == llvm::APFloat::cmpLessThan)
+        lo = corners[i];
+      if (corners[i].compare(hi) == llvm::APFloat::cmpGreaterThan)
+        hi = corners[i];
     }
 
-    // calculate perturbation term
-    result.beta = (abs_coeff_sum() + c_value) * b.beta +
-                  (b.abs_coeff_sum() + b.c_value) * beta + beta * b.beta;
-    return result;
+    return Var(Range(lo, hi));
   }
 
   Var operator/(const llvm::APFloat b) const {
